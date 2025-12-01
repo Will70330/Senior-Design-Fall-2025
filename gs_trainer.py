@@ -38,38 +38,45 @@ class GsTrainer:
             else:
                 return
 
-        # Determine PLY for initialization
-        ply_file = "object_final.ply" if use_masked else "map_final.ply"
-        ply_path = os.path.join(data_dir, ply_file)
-        
-        if not os.path.exists(ply_path):
-            # Try alternate
-            alt_ply = "map_final.ply" if use_masked else "object_final.ply"
-            if os.path.exists(os.path.join(data_dir, alt_ply)):
-                ply_path = os.path.join(data_dir, alt_ply)
-            else:
-                ply_path = None
+        # Check for point cloud files (prioritize sparse_points.ply for nerfstudio)
+        ply_candidates = [
+            "sparse_points.ply",  # Nerfstudio expects this from COLMAP/SFM
+            "object_final.ply" if use_masked else "map_final.ply",
+            "map_final.ply" if use_masked else "object_final.ply"
+        ]
+
+        ply_path = None
+        for ply_file in ply_candidates:
+            candidate_path = os.path.join(data_dir, ply_file)
+            if os.path.exists(candidate_path):
+                ply_path = candidate_path
+                break
 
         print(f"Starting 3DGS Training using {config_file}...")
         if ply_path:
-            print(f"Initializing from Point Cloud: {os.path.basename(ply_path)}")
+            ply_name = os.path.basename(ply_path)
+            print(f"Point Cloud found: {ply_name}")
+            if ply_name == "sparse_points.ply":
+                print("Nerfstudio will initialize Gaussians from sparse_points.ply")
+            else:
+                print(f"Note: Nerfstudio may use {ply_name} or random initialization")
         else:
-            print("No initial point cloud found. Using random initialization.")
-            
+            print("No point cloud found. Nerfstudio will use random initialization.")
+
         print("Navigate to https://viewer.nerf.studio (or localhost link printed below) to watch.")
-        
+
         data_path = os.path.join(data_dir, config_file)
-        
+
         cmd = [
             "ns-train", "splatfacto",
             "--data", data_path,
             "--viewer.websocket-port", "7007",
             "--vis", "viewer"
         ]
-        
-        if ply_path:
-            cmd.extend(["--pipeline.model.ply-file-path", ply_path])
-        
+
+        # Note: In nerfstudio 1.1.5, PLY initialization via command line is not supported
+        # The model will use random initialization or SFM points from the data
+
         if output_dir:
             cmd.extend(["--output-dir", output_dir])
 
@@ -107,10 +114,11 @@ class GsTrainer:
             self.process = None
             self.training = False
 
-    def export_ply(self, config_path, output_path):
+    def export_ply(self, config_path, output_path, cwd=None):
         """
         Runs ns-export to generate the PLY file.
         config_path: Path to the config.yml generated during training.
+        cwd: Directory to run the command from (should match training CWD).
         """
         if not self.is_installed():
             return
@@ -122,8 +130,14 @@ class GsTrainer:
             "--output-dir", os.path.dirname(output_path)
         ]
         
+        # Use provided CWD or default to config directory (which is often wrong for ns-export)
+        # If not provided, we try to be smart: if config is deep in outputs/, assume CWD is the project root relative to it.
+        # But best is to pass it.
+        
+        run_dir = cwd if cwd else os.path.dirname(config_path)
+        
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, cwd=run_dir)
             print("Export complete.")
         except subprocess.CalledProcessError as e:
             print(f"Export failed: {e}")
