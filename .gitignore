@@ -27,6 +27,7 @@ data/
 outputs/
 exports/
 renders/
+capture_*/
 *.ply
 *.pth
 *.pt
