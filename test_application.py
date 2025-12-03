@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QLineEdit, QFileDialog,
     QSplitter, QToolBar, QAction, QDialog, QFormLayout,
     QSpinBox, QCheckBox, QMessageBox, QProgressDialog, QTextEdit,
-    QDialogButtonBox, QProgressBar
+    QDialogButtonBox, QProgressBar, QGroupBox, QGridLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap, QIcon
@@ -34,6 +34,7 @@ import pyrealsense2 as rs
 from gs_trainer import GsTrainer
 from image_processor import ImageProcessor
 from colmap_runner import ColmapRunner
+from metrics_calculator import MetricsCalculator
 
 
 class RealsenseWorker(QThread):
@@ -230,7 +231,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("3DGS Studio - SfM & Training")
-        self.resize(1400, 800)
+        self.resize(1600, 1000)
 
         # State
         self.output_dir = os.getcwd()
@@ -248,6 +249,7 @@ class MainWindow(QMainWindow):
         self.realsense_worker = None
         self.gs_trainer = GsTrainer()
         self.colmap_runner = None
+        self.metrics_calculator = MetricsCalculator()
 
         self.init_ui()
         self.start_camera()
@@ -299,6 +301,100 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(splitter, 1)
 
+        # --- Metrics Panel ---
+        self.metrics_group = QGroupBox("Pipeline Metrics")
+        self.metrics_group.setStyleSheet("""
+            QGroupBox {
+                font-size: 14px;
+                font-weight: bold;
+                border: 2px solid #555;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px;
+            }
+        """)
+
+        metrics_main_layout = QVBoxLayout()
+        metrics_main_layout.setSpacing(15)
+        metrics_main_layout.setContentsMargins(20, 20, 20, 15)
+
+        # Metrics values in a horizontal layout
+        metrics_values_layout = QHBoxLayout()
+        metrics_values_layout.setSpacing(40)
+
+        self.metric_labels = {}
+        metric_items = [
+            ('matched_frames', 'Matched Frames'),
+            ('sparse_points', 'Sparse Points'),
+            ('gaussians', 'Gaussians'),
+            ('psnr', 'PSNR'),
+            ('ssim', 'SSIM'),
+        ]
+
+        for key, label_text in metric_items:
+            # Create a vertical layout for each metric
+            metric_box = QVBoxLayout()
+            metric_box.setSpacing(5)
+
+            # Label
+            label = QLabel(label_text)
+            label.setStyleSheet("font-size: 15px; font-weight: bold; color: #000000;")
+            label.setAlignment(Qt.AlignCenter)
+            metric_box.addWidget(label)
+
+            # Value
+            value_label = QLabel("--")
+            value_label.setStyleSheet("""
+                font-size: 18px;
+                font-weight: bold;
+                color: #4CAF50;
+                padding: 8px 15px;
+                background-color: #2a2a2a;
+                border-radius: 5px;
+                min-width: 100px;
+            """)
+            value_label.setAlignment(Qt.AlignCenter)
+            metric_box.addWidget(value_label)
+            self.metric_labels[key] = value_label
+
+            metrics_values_layout.addLayout(metric_box)
+
+        metrics_main_layout.addLayout(metrics_values_layout)
+
+        # Metrics buttons
+        metrics_btn_layout = QHBoxLayout()
+        metrics_btn_layout.setSpacing(15)
+
+        self.calc_metrics_btn = QPushButton("Calculate Metrics")
+        self.calc_metrics_btn.clicked.connect(self.calculate_metrics)
+        self.calc_metrics_btn.setToolTip("Calculate all available metrics (fast, skips PSNR/SSIM)")
+        self.calc_metrics_btn.setStyleSheet("padding: 8px 16px;")
+        metrics_btn_layout.addWidget(self.calc_metrics_btn)
+
+        self.calc_psnr_btn = QPushButton("Calculate PSNR/SSIM")
+        self.calc_psnr_btn.clicked.connect(self.calculate_psnr_ssim)
+        self.calc_psnr_btn.setToolTip("Calculate PSNR and SSIM (requires trained model, slower)")
+        self.calc_psnr_btn.setStyleSheet("padding: 8px 16px;")
+        metrics_btn_layout.addWidget(self.calc_psnr_btn)
+
+        self.export_metrics_btn = QPushButton("Export CSV")
+        self.export_metrics_btn.clicked.connect(self.export_metrics)
+        self.export_metrics_btn.setToolTip("Export metrics to gs_export/metrics.csv")
+        self.export_metrics_btn.setStyleSheet("padding: 8px 16px;")
+        metrics_btn_layout.addWidget(self.export_metrics_btn)
+
+        metrics_btn_layout.addStretch()
+        metrics_main_layout.addLayout(metrics_btn_layout)
+
+        self.metrics_group.setLayout(metrics_main_layout)
+        self.metrics_group.setMinimumHeight(160)
+        main_layout.addWidget(self.metrics_group)
+
         # --- Bottom Controls ---
         controls = QHBoxLayout()
         
@@ -321,6 +417,12 @@ class MainWindow(QMainWindow):
         self.process_btn.clicked.connect(self.process_images)
         controls.addWidget(self.process_btn)
         
+        # Matcher Type
+        self.matcher_combo = QComboBox()
+        self.matcher_combo.addItems(["Sequential", "Exhaustive"])
+        self.matcher_combo.setToolTip("Feature matching strategy")
+        controls.addWidget(self.matcher_combo)
+
         # Generate PC
         self.sfm_btn = QPushButton("2. Generate Sparse PC (SfM)")
         self.sfm_btn.clicked.connect(self.run_sfm)
@@ -449,10 +551,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No recording selected.")
             return
 
-        self.sfm_dialog = ProcessingDialog("Generating Sparse PC (COLMAP)")
+        matcher = self.matcher_combo.currentText().lower()
+        self.sfm_dialog = ProcessingDialog(f"Generating Sparse PC (COLMAP - {matcher})")
         self.sfm_dialog.show()
         
-        self.colmap_runner = ColmapRunner(self.current_recording_dir)
+        self.colmap_runner = ColmapRunner(self.current_recording_dir, matcher_type=matcher)
         self.colmap_runner.progress_update.connect(self.sfm_dialog.log)
         self.colmap_runner.processing_finished.connect(self.on_sfm_finished)
         self.colmap_runner.start()
@@ -461,6 +564,12 @@ class MainWindow(QMainWindow):
         self.sfm_dialog.finish(success, msg)
         if success:
             self.load_sparse_pc()
+            # Auto-calculate SfM metrics
+            self.metrics_calculator.set_data_dir(self.current_recording_dir)
+            self.metrics_calculator.count_matched_frames()
+            self.metrics_calculator.count_sparse_points()
+            self.update_metrics_display()
+            self.statusBar().showMessage("SfM complete. Metrics updated.")
 
     def load_sparse_pc(self):
         if not self.current_recording_dir: return
@@ -468,48 +577,48 @@ class MainWindow(QMainWindow):
         # COLMAP output via Nerfstudio usually goes to 'sparse_pc.ply' or similar depending on version.
         # ns-process-data creates 'colmap/sparse/0/points3D.ply' sometimes, OR it just exports a .ply 
         # actually ns-process-data output structure:
-        # data_dir/
-        #   colmap/
-        #   images/
-        #   transforms.json
-        #   sparse_pc.ply (sometimes)
-        
-        # We check for common locations
+        # Check for common sparse point cloud locations
         candidates = [
+            os.path.join(self.current_recording_dir, "sparse_points.ply"),
             os.path.join(self.current_recording_dir, "sparse_pc.ply"),
-            os.path.join(self.current_recording_dir, "colmap", "sparse", "0", "points3D.ply")
+            os.path.join(self.current_recording_dir, "colmap", "sparse", "0", "points3D.ply"),
+            os.path.join(self.current_recording_dir, "sparse", "0", "points3D.ply"),
+            os.path.join(self.current_recording_dir, "points3D.ply"),
         ]
-        
+
         ply_path = None
         for c in candidates:
             if os.path.exists(c):
                 ply_path = c
+                print(f"Found sparse point cloud: {c}")
                 break
-        
+
         if ply_path:
             try:
                 pcd = o3d.io.read_point_cloud(ply_path)
                 points = np.asarray(pcd.points)
                 colors = np.asarray(pcd.colors)
-                
+
                 if self.pv_actor:
                     self.plotter.remove_actor(self.pv_actor)
-                    
+
                 pv_cloud = pv.PolyData(points)
                 if len(colors) > 0:
                     pv_cloud['colors'] = (colors * 255).astype(np.uint8)
-                    
+
                 self.pv_actor = self.plotter.add_points(
-                    pv_cloud, 
+                    pv_cloud,
                     scalars='colors',
                     rgb=True,
                     point_size=3
                 )
                 self.plotter.reset_camera()
-                self.statusBar().showMessage(f"Loaded Sparse PC: {os.path.basename(ply_path)}")
+                self.statusBar().showMessage(f"Loaded Sparse PC: {os.path.basename(ply_path)} ({len(points):,} points)")
             except Exception as e:
                 print(f"Error loading PLY: {e}")
+                self.statusBar().showMessage(f"Error loading PLY: {e}")
         else:
+            print(f"Sparse PC not found. Checked: {candidates}")
             self.statusBar().showMessage("Sparse PC not found (check colmap output).")
 
     def run_training(self):
@@ -561,7 +670,15 @@ class MainWindow(QMainWindow):
         
         try:
             self.gs_trainer.export_ply(config_path, export_path, cwd=self.current_recording_dir)
-            QMessageBox.information(self, "Export Complete", f"Exported to:\n{export_path}")
+            # Auto-calculate gaussian count after export
+            self.metrics_calculator.set_data_dir(self.current_recording_dir)
+            num_gaussians = self.metrics_calculator.count_gaussians()
+            self.update_metrics_display()
+
+            msg = f"Exported to:\n{export_path}"
+            if num_gaussians:
+                msg += f"\n\nGaussians: {num_gaussians:,}"
+            QMessageBox.information(self, "Export Complete", msg)
             self.statusBar().showMessage(f"Exported to {os.path.basename(export_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", str(e))
@@ -598,7 +715,139 @@ class MainWindow(QMainWindow):
             self.current_recording_dir = d
             self.out_label.setText(f"Current: {os.path.basename(d)}")
             self.load_sparse_pc()
+            # Auto-calculate available metrics for loaded capture
+            self.metrics_calculator.set_data_dir(d)
+            self.metrics_calculator.calculate_all_metrics(skip_eval=True)
+            self.update_metrics_display()
             self.statusBar().showMessage(f"Loaded {os.path.basename(d)}")
+
+    def update_metrics_display(self):
+        """Update the metrics panel with current values"""
+        metrics = self.metrics_calculator.metrics
+
+        # Matched frames
+        if metrics.get('num_matched_frames') is not None:
+            total = metrics.get('total_input_frames', '?')
+            self.metric_labels['matched_frames'].setText(f"{metrics['num_matched_frames']}/{total}")
+        else:
+            self.metric_labels['matched_frames'].setText("--")
+
+        # Sparse points
+        if metrics.get('num_sparse_points') is not None:
+            self.metric_labels['sparse_points'].setText(f"{metrics['num_sparse_points']:,}")
+        else:
+            self.metric_labels['sparse_points'].setText("--")
+
+        # Gaussians
+        if metrics.get('num_gaussians') is not None:
+            self.metric_labels['gaussians'].setText(f"{metrics['num_gaussians']:,}")
+        else:
+            self.metric_labels['gaussians'].setText("--")
+
+        # PSNR
+        if metrics.get('psnr') is not None:
+            self.metric_labels['psnr'].setText(f"{metrics['psnr']:.2f} dB")
+        else:
+            self.metric_labels['psnr'].setText("--")
+
+        # SSIM
+        if metrics.get('ssim') is not None:
+            self.metric_labels['ssim'].setText(f"{metrics['ssim']:.4f}")
+        else:
+            self.metric_labels['ssim'].setText("--")
+
+    def calculate_metrics(self):
+        """Calculate all metrics except PSNR/SSIM (fast)"""
+        if not self.current_recording_dir:
+            QMessageBox.warning(self, "Error", "No recording selected.")
+            return
+
+        self.metrics_calculator.set_data_dir(self.current_recording_dir)
+        self.statusBar().showMessage("Calculating metrics...")
+        QApplication.processEvents()
+
+        # Use verbose=True to print debug info to terminal
+        metrics = self.metrics_calculator.calculate_all_metrics(skip_eval=True, verbose=True)
+        self.update_metrics_display()
+
+        # Build feedback message
+        found = []
+        not_found = []
+
+        if metrics.get('num_matched_frames') is not None:
+            found.append(f"Matched Frames: {metrics['num_matched_frames']}/{metrics.get('total_input_frames', '?')}")
+        else:
+            not_found.append("Matched Frames (images.bin not found)")
+
+        if metrics.get('num_sparse_points') is not None:
+            found.append(f"Sparse Points: {metrics['num_sparse_points']:,}")
+        else:
+            not_found.append("Sparse Points (sparse_pc.ply not found)")
+
+        if metrics.get('num_gaussians') is not None:
+            found.append(f"Gaussians: {metrics['num_gaussians']:,}")
+        else:
+            not_found.append("Gaussians (gs_export/splat.ply not found)")
+
+        msg = ""
+        if found:
+            msg += "Found:\n" + "\n".join(f"  - {f}" for f in found)
+        if not_found:
+            if msg:
+                msg += "\n\n"
+            msg += "Not Found:\n" + "\n".join(f"  - {n}" for n in not_found)
+            msg += "\n\n(Check terminal for detailed path info)"
+
+        if found:
+            self.statusBar().showMessage("Metrics calculated.")
+            QMessageBox.information(self, "Metrics Calculated", msg)
+        else:
+            self.statusBar().showMessage("No metrics found.")
+            QMessageBox.warning(self, "No Metrics Found", msg)
+
+    def calculate_psnr_ssim(self):
+        """Calculate PSNR and SSIM (requires trained model)"""
+        if not self.current_recording_dir:
+            QMessageBox.warning(self, "Error", "No recording selected.")
+            return
+
+        # Check for config.yml
+        outputs_dir = os.path.join(self.current_recording_dir, "outputs")
+        if not os.path.exists(outputs_dir):
+            QMessageBox.warning(self, "Error", "No trained model found. Train first.")
+            return
+
+        self.metrics_calculator.set_data_dir(self.current_recording_dir)
+        self.statusBar().showMessage("Calculating PSNR/SSIM (this may take a few minutes)...")
+        QApplication.processEvents()
+
+        psnr, ssim = self.metrics_calculator.calculate_psnr_ssim()
+
+        if psnr is None or ssim is None:
+            QMessageBox.warning(self, "Warning", "PSNR/SSIM calculation failed. Check terminal for details.")
+        else:
+            self.update_metrics_display()
+            QMessageBox.information(self, "Results", f"PSNR: {psnr:.2f} dB\nSSIM: {ssim:.4f}")
+
+        self.statusBar().showMessage("PSNR/SSIM calculation complete.")
+
+    def export_metrics(self):
+        """Export metrics to CSV file"""
+        if not self.current_recording_dir:
+            QMessageBox.warning(self, "Error", "No recording selected.")
+            return
+
+        self.metrics_calculator.set_data_dir(self.current_recording_dir)
+
+        # Calculate metrics if not already done
+        if self.metrics_calculator.metrics.get('num_matched_frames') is None:
+            self.calculate_metrics()
+
+        csv_path = self.metrics_calculator.export_to_csv()
+        if csv_path:
+            QMessageBox.information(self, "Export Complete", f"Metrics exported to:\n{csv_path}")
+        else:
+            QMessageBox.warning(self, "Error", "Failed to export metrics.")
 
     def closeEvent(self, event):
         if self.realsense_worker:

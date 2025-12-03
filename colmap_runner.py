@@ -11,9 +11,10 @@ class ColmapRunner(QThread):
     processing_finished = pyqtSignal(bool, str)
     progress_update = pyqtSignal(str)
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, matcher_type="sequential"):
         super().__init__()
         self.data_dir = data_dir
+        self.matcher_type = matcher_type
         self.process = None
 
     def run_cmd(self, cmd, description):
@@ -53,7 +54,13 @@ class ColmapRunner(QThread):
             self.processing_finished.emit(False, "No images directory found.")
             return
 
-        # Ensure clean directories
+        # Ensure clean directories (Fixes ghost images bug)
+        if os.path.exists(colmap_dir):
+            try:
+                shutil.rmtree(colmap_dir)
+            except Exception as e:
+                self.progress_update.emit(f"Warning: Could not clean colmap dir: {e}")
+
         os.makedirs(colmap_dir, exist_ok=True)
         os.makedirs(sparse_dir, exist_ok=True)
 
@@ -72,14 +79,22 @@ class ColmapRunner(QThread):
             return
 
         # 2. Matcher
-        # using sequential_matcher (loop detection disabled as we lack vocab tree)
-        cmd_match = [
-            "colmap", "sequential_matcher",
-            "--database_path", db_path,
-            "--FeatureMatching.use_gpu", "1",
-            "--SequentialMatching.loop_detection", "0"
-        ]
-        if not self.run_cmd(cmd_match, "Matching Features"):
+        if self.matcher_type == "exhaustive":
+            cmd_match = [
+                "colmap", "exhaustive_matcher",
+                "--database_path", db_path,
+                "--FeatureMatching.use_gpu", "1"
+            ]
+        else:
+            # sequential_matcher (loop detection disabled as we lack vocab tree)
+            cmd_match = [
+                "colmap", "sequential_matcher",
+                "--database_path", db_path,
+                "--FeatureMatching.use_gpu", "1",
+                "--SequentialMatching.loop_detection", "0"
+            ]
+
+        if not self.run_cmd(cmd_match, f"Matching Features ({self.matcher_type})"):
             self.processing_finished.emit(False, "Feature matching failed.")
             return
 
@@ -90,7 +105,7 @@ class ColmapRunner(QThread):
             "--image_path", images_dir,
             "--output_path", sparse_dir
         ]
-        if not self.run_cmd(cmd_mapper, "Running SfM (Mapper)нка"):
+        if not self.run_cmd(cmd_mapper, "Running SfM (Mapper)anka"):
             self.processing_finished.emit(False, "SfM Mapper failed.")
             return
 
