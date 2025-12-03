@@ -76,7 +76,8 @@ class NetworkRealsenseWorker(QThread):
 
             # Subscriber (Video)
             self.sub_socket = self.ctx.socket(zmq.SUB)
-            self.sub_socket.setsockopt(zmq.CONFLATE, 1) # Only keep last message
+            self.sub_socket.setsockopt(zmq.RCVHWM, 1) # Drop old frames if processing is slow
+            # self.sub_socket.setsockopt(zmq.CONFLATE, 1) # CAUSES CRASH with multipart messages
             self.sub_socket.connect(f"tcp://{self.ip_address}:5556")
             self.sub_socket.subscribe(b"")
             

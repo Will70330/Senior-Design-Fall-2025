@@ -74,32 +74,72 @@ class CameraServer:
 
     def start_streaming(self):
         with self.lock:
-            try:
-                self.pipeline = rs.pipeline()
-                self.config = rs.config()
-                
-                self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-                self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-                
-                profile = self.pipeline.start(self.config)
-                
-                # Optimizations
-                device = profile.get_device()
-                depth_sensor = device.first_depth_sensor()
-                color_sensor = device.first_color_sensor()
-                
-                if depth_sensor.supports(rs.option.emitter_enabled):
-                    depth_sensor.set_option(rs.option.emitter_enabled, 1.0)
-                if color_sensor.supports(rs.option.auto_exposure_priority):
-                    color_sensor.set_option(rs.option.auto_exposure_priority, 0.0)
-                
-                self.device_name = device.get_info(rs.camera_info.name)
-                self.streaming = True
-                print(f"Streaming started: {self.device_name} @ {self.width}x{self.height} {self.fps}fps")
-                
-            except Exception as e:
-                print(f"Failed to start streaming: {e}")
-                self.streaming = False
+            # Define a series of configuration attempts
+            attempts = [
+                {"desc": "Requested Settings", "w": self.width, "h": self.height, "fps": self.fps, "fmt": True},
+                {"desc": "Lower FPS", "w": self.width, "h": self.height, "fps": 15, "fmt": True},
+                {"desc": "USB 2.0 High (480p)", "w": 640, "h": 480, "fps": 15, "fmt": False}, # Let SDK pick format
+                {"desc": "USB 2.0 Low (240p)", "w": 424, "h": 240, "fps": 15, "fmt": True},
+                {"desc": "Minimal (Any/Any)", "w": 0, "h": 0, "fps": 0, "fmt": False} # Default stream
+            ]
+
+            for attempt in attempts:
+                try:
+                    print(f"Attempting stream config: {attempt['desc']}...")
+                    self.pipeline = rs.pipeline()
+                    self.config = rs.config()
+                    
+                    w, h, f = attempt["w"], attempt["h"], attempt["fps"]
+                    
+                    if w == 0:
+                        # Minimal/Default - just enable streams without specific reqs
+                        self.config.enable_stream(rs.stream.depth)
+                        self.config.enable_stream(rs.stream.color)
+                    else:
+                        d_fmt = rs.format.z16
+                        c_fmt = rs.format.bgr8 if attempt["fmt"] else rs.format.any
+                        
+                        self.config.enable_stream(rs.stream.depth, w, h, d_fmt, f)
+                        self.config.enable_stream(rs.stream.color, w, h, c_fmt, f)
+                    
+                    profile = self.pipeline.start(self.config)
+                    
+                    # If we got here, it worked!
+                    # Update our internal state to match what we actually got
+                    device = profile.get_device()
+                    depth_sensor = device.first_depth_sensor()
+                    color_sensor = device.first_color_sensor()
+                    
+                    # Apply options if supported
+                    if depth_sensor.supports(rs.option.emitter_enabled):
+                        depth_sensor.set_option(rs.option.emitter_enabled, 1.0)
+                    if color_sensor.supports(rs.option.auto_exposure_priority):
+                        color_sensor.set_option(rs.option.auto_exposure_priority, 0.0)
+                    
+                    self.device_name = device.get_info(rs.camera_info.name)
+                    
+                    # Read back actual stream props
+                    v_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                    self.width = v_profile.width()
+                    self.height = v_profile.height()
+                    self.fps = v_profile.fps()
+                    
+                    self.streaming = True
+                    print(f"Success! Streaming: {self.device_name} @ {self.width}x{self.height} {self.fps}fps")
+                    return # Exit function on success
+                    
+                except Exception as e:
+                    print(f"Config failed ({attempt['desc']}): {e}")
+                    if self.pipeline:
+                        try:
+                            self.pipeline.stop()
+                        except:
+                            pass
+                        self.pipeline = None
+            
+            # If loop finishes without returning, all failed
+            print("All streaming configurations failed.")
+            self.streaming = False
 
     def stop_streaming(self):
         with self.lock:
