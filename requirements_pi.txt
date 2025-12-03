@@ -1,0 +1,24 @@
+# Requirements for Raspberry Pi (ARM64) - Data Capture Only
+# These packages are compatible with aarch64/ARM64 architecture
+# GPU/CUDA packages are excluded as they require NVIDIA hardware
+
+# Core dependencies
+numpy
+opencv-python-headless
+
+# GUI
+PyQt5
+
+# 3D Visualization (for point cloud viewing)
+open3d
+pyvista
+pyvistaqt
+vtk
+
+# RealSense camera support
+# Note: pyrealsense2 may need to be built from source on ARM64
+# See: https://github.com/IntelRealSense/librealsense/blob/master/doc/installation.md
+pyrealsense2
+
+# Additional utilities used in the codebase
+Pillow
