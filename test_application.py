@@ -13,6 +13,9 @@ import json
 import numpy as np
 import cv2
 import open3d as o3d
+import zmq
+import socket
+import struct
 from pathlib import Path
 
 import pyvista as pv
@@ -23,7 +26,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QLineEdit, QFileDialog,
     QSplitter, QToolBar, QAction, QDialog, QFormLayout,
     QSpinBox, QCheckBox, QMessageBox, QProgressDialog, QTextEdit,
-    QDialogButtonBox, QProgressBar, QGroupBox, QGridLayout
+    QDialogButtonBox, QProgressBar, QGroupBox, QGridLayout, QTabWidget
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap, QIcon
@@ -35,6 +38,145 @@ from gs_trainer import GsTrainer
 from image_processor import ImageProcessor
 from colmap_runner import ColmapRunner
 from metrics_calculator import MetricsCalculator
+
+
+class NetworkRealsenseWorker(QThread):
+    """Background thread for Wireless RealSense capture"""
+
+    frame_ready = pyqtSignal(np.ndarray, np.ndarray, dict)  # color, depth, stats
+    error_occurred = pyqtSignal(str)
+    connection_status = pyqtSignal(bool)
+
+    def __init__(self, ip_address="localhost"):
+        super().__init__()
+        self.running = False
+        self.paused = False
+        self.recording = False
+        self.ip_address = ip_address
+
+        # ZMQ
+        self.ctx = zmq.Context()
+        self.sub_socket = None
+        self.req_socket = None
+        
+        # Recording state
+        self.record_dir = None
+        self.images_dir = None
+        self.frame_idx = 0
+
+        # Settings
+        self.target_fps = 30
+        self.width = 640
+        self.height = 480
+
+    def connect_sockets(self):
+        try:
+            if self.sub_socket: self.sub_socket.close()
+            if self.req_socket: self.req_socket.close()
+
+            # Subscriber (Video)
+            self.sub_socket = self.ctx.socket(zmq.SUB)
+            self.sub_socket.setsockopt(zmq.CONFLATE, 1) # Only keep last message
+            self.sub_socket.connect(f"tcp://{self.ip_address}:5556")
+            self.sub_socket.subscribe(b"")
+            
+            # Request (Control)
+            self.req_socket = self.ctx.socket(zmq.REQ)
+            self.req_socket.connect(f"tcp://{self.ip_address}:5555")
+            self.req_socket.setsockopt(zmq.RCVTIMEO, 2000) # 2s timeout
+            self.req_socket.setsockopt(zmq.LINGER, 0)
+            
+            # Ping to check connection
+            self.req_socket.send_json({"command": "ping"})
+            resp = self.req_socket.recv_json()
+            return resp.get("status") == "ok"
+        except Exception as e:
+            self.error_occurred.emit(f"Connection failed: {e}")
+            return False
+
+    def update_remote_settings(self, width, height, fps):
+        """Send settings to the Pi"""
+        try:
+            if not self.req_socket: return False
+            msg = {"command": "set_settings", "width": width, "height": height, "fps": fps}
+            self.req_socket.send_json(msg)
+            resp = self.req_socket.recv_json()
+            return resp.get("status") == "ok"
+        except Exception as e:
+            print(f"Failed to update settings: {e}")
+            return False
+
+    def create_recording_dir(self, base_dir):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_dir = os.path.join(base_dir, f"capture_{timestamp}")
+        self.images_dir = os.path.join(self.record_dir, "images")
+        os.makedirs(self.images_dir, exist_ok=True)
+        self.frame_idx = 0
+        return self.record_dir
+
+    def run(self):
+        if not self.connect_sockets():
+            self.connection_status.emit(False)
+            return
+        
+        self.connection_status.emit(True)
+        self.update_remote_settings(self.width, self.height, self.target_fps)
+        
+        self.running = True
+        frame_count = 0
+
+        while self.running:
+            if self.paused:
+                self.msleep(100)
+                continue
+
+            try:
+                # Receive Header
+                header = self.sub_socket.recv_json()
+                # Receive Color (Encoded)
+                color_bytes = self.sub_socket.recv()
+                # Receive Depth (Encoded)
+                depth_bytes = self.sub_socket.recv()
+
+                # Decode
+                color_arr = np.frombuffer(color_bytes, dtype=np.uint8)
+                color_image = cv2.imdecode(color_arr, cv2.IMREAD_COLOR)
+                
+                depth_arr = np.frombuffer(depth_bytes, dtype=np.uint8)
+                depth_image = cv2.imdecode(depth_arr, cv2.IMREAD_UNCHANGED) # Keep 16-bit
+
+                if color_image is None or depth_image is None:
+                    continue
+
+                # Recording logic (Save locally on laptop)
+                if self.recording and self.images_dir:
+                    # Use the same format as before
+                    cv2.imwrite(os.path.join(self.images_dir, f"frame_{self.frame_idx:05d}.jpg"), color_image)
+                    cv2.imwrite(os.path.join(self.images_dir, f"depth_{self.frame_idx:05d}.png"), depth_image)
+                    self.frame_idx += 1
+
+                stats = {
+                    'frame_idx': self.frame_idx if self.recording else frame_count,
+                    'recording': self.recording,
+                }
+                
+                self.frame_ready.emit(color_image, depth_image, stats)
+                frame_count += 1
+
+            except zmq.Again:
+                continue
+            except Exception as e:
+                print(f"Stream error: {e}")
+                # self.error_occurred.emit(f"Stream error: {str(e)}")
+                continue
+
+        if self.sub_socket:
+            self.sub_socket.close()
+        if self.req_socket:
+            self.req_socket.close()
+
+    def stop(self):
+        self.running = False
 
 
 class RealsenseWorker(QThread):
@@ -60,6 +202,8 @@ class RealsenseWorker(QThread):
 
         # Settings
         self.target_fps = 30
+        self.width = 640
+        self.height = 480
 
     def initialize_camera(self):
         try:
@@ -72,9 +216,8 @@ class RealsenseWorker(QThread):
                 return False
 
             # Configure streams
-            width, height = 640, 480
-            self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, self.target_fps)
-            self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, self.target_fps)
+            self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.target_fps)
+            self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps)
 
             profile = self.pipeline.start(self.config)
             
@@ -196,32 +339,107 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self.setWindowTitle("Settings")
         self.setModal(True)
-        layout = QFormLayout()
-
+        
+        self.layout = QVBoxLayout()
+        self.tabs = QTabWidget()
+        
+        # --- Tab 1: Camera & Connection ---
+        self.cam_tab = QWidget()
+        cam_layout = QFormLayout()
+        
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Local USB", "Wireless (Network)"])
+        self.mode_combo.setCurrentText(self.settings.get('mode', "Local USB"))
+        cam_layout.addRow("Connection Mode:", self.mode_combo)
+        
+        self.ip_input = QLineEdit()
+        self.ip_input.setText(self.settings.get('ip_address', "192.168.1.X"))
+        self.ip_input.setPlaceholderText("e.g. 192.168.1.100")
+        
+        ip_layout = QHBoxLayout()
+        ip_layout.addWidget(self.ip_input)
+        self.discover_btn = QPushButton("Auto Detect")
+        self.discover_btn.clicked.connect(self.discover_camera)
+        ip_layout.addWidget(self.discover_btn)
+        
+        cam_layout.addRow("Camera IP (Wireless):", ip_layout)
+        
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(self.settings.get('target_fps', 30))
-        layout.addRow("Target FPS:", self.fps_spin)
+        cam_layout.addRow("Target FPS:", self.fps_spin)
+        
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["640x480", "848x480", "1280x720", "424x240"])
+        cur_res = f"{self.settings.get('width', 640)}x{self.settings.get('height', 480)}"
+        self.res_combo.setCurrentText(cur_res)
+        cam_layout.addRow("Resolution:", self.res_combo)
+
+        self.cam_tab.setLayout(cam_layout)
+        self.tabs.addTab(self.cam_tab, "Camera")
+
+        # --- Tab 2: Processing ---
+        self.proc_tab = QWidget()
+        proc_layout = QFormLayout()
         
         self.max_frames_spin = QSpinBox()
         self.max_frames_spin.setRange(10, 5000)
         self.max_frames_spin.setValue(self.settings.get('max_frames', 200))
-        layout.addRow("Max Frames (Processing):", self.max_frames_spin)
+        proc_layout.addRow("Max Frames (Processing):", self.max_frames_spin)
 
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1024, 65535)
         self.port_spin.setValue(self.settings.get('viser_port', 7007))
-        layout.addRow("Viser Port:", self.port_spin)
+        proc_layout.addRow("Viser Port:", self.port_spin)
+        
+        self.proc_tab.setLayout(proc_layout)
+        self.tabs.addTab(self.proc_tab, "Processing")
+
+        self.layout.addWidget(self.tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-        self.setLayout(layout)
+        self.layout.addWidget(buttons)
+        self.setLayout(self.layout)
+        
+        # Enable/Disable IP field
+        self.mode_combo.currentTextChanged.connect(self.toggle_ip_field)
+        self.toggle_ip_field(self.mode_combo.currentText())
+
+    def toggle_ip_field(self, text):
+        is_wireless = (text == "Wireless (Network)")
+        self.ip_input.setEnabled(is_wireless)
+        self.discover_btn.setEnabled(is_wireless)
+
+    def discover_camera(self):
+        self.discover_btn.setText("Searching...")
+        QApplication.processEvents()
+        
+        # UDP Listen
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", 5554))
+        sock.settimeout(3.0)
+        
+        try:
+            data, addr = sock.recvfrom(1024)
+            if b"3DGS_CAMERA_SERVER" in data:
+                self.ip_input.setText(addr[0])
+                QMessageBox.information(self, "Found", f"Camera found at {addr[0]}")
+        except socket.timeout:
+            QMessageBox.warning(self, "Not Found", "No camera beacon detected.\nEnsure both devices are on the same network.")
+        finally:
+            sock.close()
+            self.discover_btn.setText("Auto Detect")
 
     def get_settings(self):
+        w, h = map(int, self.res_combo.currentText().split('x'))
         return {
+            'mode': self.mode_combo.currentText(),
+            'ip_address': self.ip_input.text(),
             'target_fps': self.fps_spin.value(),
+            'width': w,
+            'height': h,
             'max_frames': self.max_frames_spin.value(),
             'min_frames': self.settings.get('min_frames', 50),
             'viser_port': self.port_spin.value()
@@ -239,14 +457,18 @@ class MainWindow(QMainWindow):
         
         # Settings
         self.settings = {
+            'mode': 'Local USB',
+            'ip_address': '',
             'max_frames': 200,
             'min_frames': 50,
             'target_fps': 30,
+            'width': 640,
+            'height': 480,
             'viser_port': 7007
         }
 
         # Workers
-        self.realsense_worker = None
+        self.camera_worker = None # Can be RealsenseWorker or NetworkRealsenseWorker
         self.gs_trainer = GsTrainer()
         self.colmap_runner = None
         self.metrics_calculator = MetricsCalculator()
@@ -274,6 +496,10 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.out_label)
         
         top_bar.addStretch()
+        
+        self.conn_status_label = QLabel("Initializing...")
+        self.conn_status_label.setStyleSheet("font-weight: bold; color: gray;")
+        top_bar.addWidget(self.conn_status_label)
         
         self.settings_btn = QPushButton("⚙ Settings")
         self.settings_btn.clicked.connect(self.show_settings)
@@ -445,25 +671,47 @@ class MainWindow(QMainWindow):
     def show_settings(self):
         dialog = SettingsDialog(self, self.settings)
         if dialog.exec_() == QDialog.Accepted:
-            self.settings = dialog.get_settings()
-            # Update worker if running
-            if self.realsense_worker:
-                self.realsense_worker.target_fps = self.settings['target_fps']
-                # Note: Changing FPS might require restarting pipeline, 
-                # but we'll just set the var for next init or handle it if we want live update
-                # For now, user might need to restart app or we add restart logic.
-                # Let's try to restart camera if fps changed
-                self.realsense_worker.stop()
-                self.realsense_worker.wait()
-                self.realsense_worker.start()
+            new_settings = dialog.get_settings()
+            old_mode = self.settings.get('mode')
+            self.settings = new_settings
             
-            self.statusBar().showMessage("Settings updated (Camera restarted)")
+            # Restart camera if settings changed that affect it
+            if self.camera_worker:
+                self.camera_worker.stop()
+                self.camera_worker.wait()
+            
+            self.start_camera()
+            
+            self.statusBar().showMessage("Settings updated")
 
     def start_camera(self):
-        self.realsense_worker = RealsenseWorker()
-        self.realsense_worker.frame_ready.connect(self.on_frame_ready)
-        self.realsense_worker.error_occurred.connect(lambda e: self.statusBar().showMessage(f"Camera Error: {e}"))
-        self.realsense_worker.start()
+        is_wireless = (self.settings.get('mode') == "Wireless (Network)")
+        
+        if is_wireless:
+            ip = self.settings.get('ip_address', '')
+            self.camera_worker = NetworkRealsenseWorker(ip_address=ip)
+            self.conn_status_label.setText(f"Connecting to {ip}...")
+            self.camera_worker.connection_status.connect(self.on_connection_status)
+        else:
+            self.camera_worker = RealsenseWorker()
+            self.conn_status_label.setText("Local Camera")
+            
+        # Apply settings
+        self.camera_worker.target_fps = self.settings.get('target_fps', 30)
+        self.camera_worker.width = self.settings.get('width', 640)
+        self.camera_worker.height = self.settings.get('height', 480)
+
+        self.camera_worker.frame_ready.connect(self.on_frame_ready)
+        self.camera_worker.error_occurred.connect(lambda e: self.statusBar().showMessage(f"Camera Error: {e}"))
+        self.camera_worker.start()
+
+    def on_connection_status(self, connected):
+        if connected:
+            self.conn_status_label.setText("Wireless: Connected 🟢")
+            self.conn_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.conn_status_label.setText("Wireless: Disconnected 🔴")
+            self.conn_status_label.setStyleSheet("color: red; font-weight: bold;")
 
     def on_frame_ready(self, color, depth, stats):
         # Update Image
@@ -484,16 +732,16 @@ class MainWindow(QMainWindow):
             self.record_btn.setStyleSheet("padding: 10px;")
 
     def toggle_recording(self, checked):
-        if not self.realsense_worker: return
+        if not self.camera_worker: return
         
         if checked:
-            dir_path = self.realsense_worker.create_recording_dir(self.output_dir)
+            dir_path = self.camera_worker.create_recording_dir(self.output_dir)
             self.current_recording_dir = dir_path
-            self.realsense_worker.recording = True
+            self.camera_worker.recording = True
             self.statusBar().showMessage(f"Recording to {dir_path}")
             self.out_label.setText(f"Current: {os.path.basename(dir_path)}")
         else:
-            self.realsense_worker.recording = False
+            self.camera_worker.recording = False
             self.statusBar().showMessage(f"Recording saved to {self.current_recording_dir}")
 
     def reset_images(self):
@@ -684,7 +932,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Failed", str(e))
 
     def select_output_directory(self):
-        if self.realsense_worker: self.realsense_worker.paused = True
+        if self.camera_worker: self.camera_worker.paused = True
         
         d = QFileDialog.getExistingDirectory(
             self, 
@@ -693,14 +941,14 @@ class MainWindow(QMainWindow):
             options=QFileDialog.DontUseNativeDialog
         )
         
-        if self.realsense_worker: self.realsense_worker.paused = False
+        if self.camera_worker: self.camera_worker.paused = False
         
         if d:
             self.output_dir = d
             self.out_label.setText(f"Path: {d}")
 
     def load_existing_capture(self):
-        if self.realsense_worker: self.realsense_worker.paused = True
+        if self.camera_worker: self.camera_worker.paused = True
 
         d = QFileDialog.getExistingDirectory(
             self, 
@@ -709,7 +957,7 @@ class MainWindow(QMainWindow):
             options=QFileDialog.DontUseNativeDialog
         )
         
-        if self.realsense_worker: self.realsense_worker.paused = False
+        if self.camera_worker: self.camera_worker.paused = False
 
         if d:
             self.current_recording_dir = d
@@ -850,8 +1098,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Failed to export metrics.")
 
     def closeEvent(self, event):
-        if self.realsense_worker:
-            self.realsense_worker.stop()
+        if self.camera_worker:
+            self.camera_worker.stop()
         if self.gs_trainer.training:
             self.gs_trainer.stop()
         try:
