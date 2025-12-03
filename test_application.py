@@ -13,10 +13,20 @@ import json
 import numpy as np
 import cv2
 import open3d as o3d
-import zmq
-import socket
 import struct
 from pathlib import Path
+import time
+
+# ROS 2 Imports
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image, CameraInfo
+    import message_filters
+    ROS_AVAILABLE = True
+except ImportError:
+    ROS_AVAILABLE = False
+    print("Warning: ROS 2 (rclpy) not found. Wireless mode will be disabled.")
 
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -40,72 +50,29 @@ from colmap_runner import ColmapRunner
 from metrics_calculator import MetricsCalculator
 
 
-class NetworkRealsenseWorker(QThread):
-    """Background thread for Wireless RealSense capture"""
+class RosRealsenseWorker(QThread):
+    """Background thread for Wireless RealSense capture via ROS 2"""
 
     frame_ready = pyqtSignal(np.ndarray, np.ndarray, dict)  # color, depth, stats
     error_occurred = pyqtSignal(str)
     connection_status = pyqtSignal(bool)
 
-    def __init__(self, ip_address="localhost"):
+    def __init__(self):
         super().__init__()
         self.running = False
         self.paused = False
         self.recording = False
-        self.ip_address = ip_address
-
-        # ZMQ
-        self.ctx = zmq.Context()
-        self.sub_socket = None
-        self.req_socket = None
+        self.node = None
         
         # Recording state
         self.record_dir = None
         self.images_dir = None
         self.frame_idx = 0
 
-        # Settings
+        # Settings (updated by main thread)
         self.target_fps = 30
         self.width = 640
         self.height = 480
-
-    def connect_sockets(self):
-        try:
-            if self.sub_socket: self.sub_socket.close()
-            if self.req_socket: self.req_socket.close()
-
-            # Subscriber (Video)
-            self.sub_socket = self.ctx.socket(zmq.SUB)
-            self.sub_socket.setsockopt(zmq.RCVHWM, 1) # Drop old frames if processing is slow
-            # self.sub_socket.setsockopt(zmq.CONFLATE, 1) # CAUSES CRASH with multipart messages
-            self.sub_socket.connect(f"tcp://{self.ip_address}:5556")
-            self.sub_socket.subscribe(b"")
-            
-            # Request (Control)
-            self.req_socket = self.ctx.socket(zmq.REQ)
-            self.req_socket.connect(f"tcp://{self.ip_address}:5555")
-            self.req_socket.setsockopt(zmq.RCVTIMEO, 2000) # 2s timeout
-            self.req_socket.setsockopt(zmq.LINGER, 0)
-            
-            # Ping to check connection
-            self.req_socket.send_json({"command": "ping"})
-            resp = self.req_socket.recv_json()
-            return resp.get("status") == "ok"
-        except Exception as e:
-            self.error_occurred.emit(f"Connection failed: {e}")
-            return False
-
-    def update_remote_settings(self, width, height, fps):
-        """Send settings to the Pi"""
-        try:
-            if not self.req_socket: return False
-            msg = {"command": "set_settings", "width": width, "height": height, "fps": fps}
-            self.req_socket.send_json(msg)
-            resp = self.req_socket.recv_json()
-            return resp.get("status") == "ok"
-        except Exception as e:
-            print(f"Failed to update settings: {e}")
-            return False
 
     def create_recording_dir(self, base_dir):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -115,69 +82,73 @@ class NetworkRealsenseWorker(QThread):
         self.frame_idx = 0
         return self.record_dir
 
-    def run(self):
-        if not self.connect_sockets():
-            self.connection_status.emit(False)
+    def callback(self, color_msg, depth_msg):
+        if self.paused:
             return
+
+        try:
+            # Decode Color (BGR8)
+            color_arr = np.frombuffer(color_msg.data, dtype=np.uint8)
+            color_image = color_arr.reshape((color_msg.height, color_msg.width, 3))
+            
+            # Decode Depth (16UC1)
+            depth_arr = np.frombuffer(depth_msg.data, dtype=np.uint16)
+            depth_image = depth_arr.reshape((depth_msg.height, depth_msg.width))
+
+            # Recording logic
+            if self.recording and self.images_dir:
+                cv2.imwrite(os.path.join(self.images_dir, f"frame_{self.frame_idx:05d}.jpg"), color_image)
+                cv2.imwrite(os.path.join(self.images_dir, f"depth_{self.frame_idx:05d}.png"), depth_image)
+                self.frame_idx += 1
+
+            stats = {
+                'frame_idx': self.frame_idx if self.recording else 0,
+                'recording': self.recording,
+            }
+            
+            self.frame_ready.emit(color_image, depth_image, stats)
+            
+            # Determine connection status by data flow
+            self.connection_status.emit(True)
+            
+        except Exception as e:
+            print(f"Frame decode error: {e}")
+
+    def run(self):
+        if not ROS_AVAILABLE:
+            self.error_occurred.emit("ROS 2 libraries not found.")
+            return
+
+        try:
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception as e:
+            print(f"RCLPY Init error: {e}")
+
+        self.node = rclpy.create_node('laptop_visualizer')
         
-        self.connection_status.emit(True)
-        self.update_remote_settings(self.width, self.height, self.target_fps)
+        # Subscribers
+        color_sub = message_filters.Subscriber(self.node, Image, '/camera/color/image_raw')
+        depth_sub = message_filters.Subscriber(self.node, Image, '/camera/depth/image_raw')
+        
+        # Sync (Approximate because timestamps might drift slightly over wireless)
+        ts = message_filters.ApproximateTimeSynchronizer([color_sub, depth_sub], 10, 0.1)
+        ts.registerCallback(self.callback)
         
         self.running = True
-        frame_count = 0
+        self.connection_status.emit(True) # Optimistic init
 
-        while self.running:
-            if self.paused:
-                self.msleep(100)
-                continue
-
-            try:
-                # Receive Header
-                header = self.sub_socket.recv_json()
-                # Receive Color (Encoded)
-                color_bytes = self.sub_socket.recv()
-                # Receive Depth (Encoded)
-                depth_bytes = self.sub_socket.recv()
-
-                # Decode
-                color_arr = np.frombuffer(color_bytes, dtype=np.uint8)
-                color_image = cv2.imdecode(color_arr, cv2.IMREAD_COLOR)
-                
-                depth_arr = np.frombuffer(depth_bytes, dtype=np.uint8)
-                depth_image = cv2.imdecode(depth_arr, cv2.IMREAD_UNCHANGED) # Keep 16-bit
-
-                if color_image is None or depth_image is None:
-                    continue
-
-                # Recording logic (Save locally on laptop)
-                if self.recording and self.images_dir:
-                    # Use the same format as before
-                    cv2.imwrite(os.path.join(self.images_dir, f"frame_{self.frame_idx:05d}.jpg"), color_image)
-                    cv2.imwrite(os.path.join(self.images_dir, f"depth_{self.frame_idx:05d}.png"), depth_image)
-                    self.frame_idx += 1
-
-                stats = {
-                    'frame_idx': self.frame_idx if self.recording else frame_count,
-                    'recording': self.recording,
-                }
-                
-                self.frame_ready.emit(color_image, depth_image, stats)
-                frame_count += 1
-
-            except zmq.Again:
-                continue
-            except Exception as e:
-                print(f"Stream error: {e}")
-                # self.error_occurred.emit(f"Stream error: {str(e)}")
-                continue
-
-        if self.sub_socket:
-            self.sub_socket.close()
-        if self.req_socket:
-            self.req_socket.close()
+        while self.running and rclpy.ok():
+            # Spin once to process callbacks
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+            
+        self.node.destroy_node()
+        # Do not rclpy.shutdown() here if other nodes might exist, 
+        # but for this app it's likely fine or handled by global cleanup.
 
     def stop(self):
         self.running = False
+        self.wait()
 
 
 class RealsenseWorker(QThread):
@@ -349,21 +320,16 @@ class SettingsDialog(QDialog):
         cam_layout = QFormLayout()
         
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Local USB", "Wireless (Network)"])
+        self.mode_combo.addItems(["Local USB", "Wireless (ROS 2)"])
         self.mode_combo.setCurrentText(self.settings.get('mode', "Local USB"))
         cam_layout.addRow("Connection Mode:", self.mode_combo)
         
+        # ROS 2 uses discovery, IP optional but kept for UI consistency or future advanced config
         self.ip_input = QLineEdit()
-        self.ip_input.setText(self.settings.get('ip_address', "192.168.1.X"))
-        self.ip_input.setPlaceholderText("e.g. 192.168.1.100")
-        
-        ip_layout = QHBoxLayout()
-        ip_layout.addWidget(self.ip_input)
-        self.discover_btn = QPushButton("Auto Detect")
-        self.discover_btn.clicked.connect(self.discover_camera)
-        ip_layout.addWidget(self.discover_btn)
-        
-        cam_layout.addRow("Camera IP (Wireless):", ip_layout)
+        self.ip_input.setText(self.settings.get('ip_address', ""))
+        self.ip_input.setPlaceholderText("Auto-Discovery (Leave Empty)")
+        self.ip_input.setEnabled(False) # Disabled for ROS 2 auto-discovery
+        cam_layout.addRow("Camera IP:", self.ip_input)
         
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
@@ -404,34 +370,12 @@ class SettingsDialog(QDialog):
         self.layout.addWidget(buttons)
         self.setLayout(self.layout)
         
-        # Enable/Disable IP field
+        # Trigger mode update
         self.mode_combo.currentTextChanged.connect(self.toggle_ip_field)
         self.toggle_ip_field(self.mode_combo.currentText())
 
     def toggle_ip_field(self, text):
-        is_wireless = (text == "Wireless (Network)")
-        self.ip_input.setEnabled(is_wireless)
-        self.discover_btn.setEnabled(is_wireless)
-
-    def discover_camera(self):
-        self.discover_btn.setText("Searching...")
-        QApplication.processEvents()
-        
-        # UDP Listen
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", 5554))
-        sock.settimeout(3.0)
-        
-        try:
-            data, addr = sock.recvfrom(1024)
-            if b"3DGS_CAMERA_SERVER" in data:
-                self.ip_input.setText(addr[0])
-                QMessageBox.information(self, "Found", f"Camera found at {addr[0]}")
-        except socket.timeout:
-            QMessageBox.warning(self, "Not Found", "No camera beacon detected.\nEnsure both devices are on the same network.")
-        finally:
-            sock.close()
-            self.discover_btn.setText("Auto Detect")
+        pass # Kept for compatibility, but currently no-op as we force auto-discovery
 
     def get_settings(self):
         w, h = map(int, self.res_combo.currentText().split('x'))
@@ -449,7 +393,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("3DGS Studio - SfM & Training")
+        self.setWindowTitle("3DGS Studio - SfM & Training (ROS 2 Enabled)")
         self.resize(1600, 1000)
 
         # State
@@ -469,7 +413,7 @@ class MainWindow(QMainWindow):
         }
 
         # Workers
-        self.camera_worker = None # Can be RealsenseWorker or NetworkRealsenseWorker
+        self.camera_worker = None 
         self.gs_trainer = GsTrainer()
         self.colmap_runner = None
         self.metrics_calculator = MetricsCalculator()
@@ -686,12 +630,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Settings updated")
 
     def start_camera(self):
-        is_wireless = (self.settings.get('mode') == "Wireless (Network)")
+        mode = self.settings.get('mode')
         
-        if is_wireless:
-            ip = self.settings.get('ip_address', '')
-            self.camera_worker = NetworkRealsenseWorker(ip_address=ip)
-            self.conn_status_label.setText(f"Connecting to {ip}...")
+        if "Wireless" in mode:
+            if not ROS_AVAILABLE:
+                QMessageBox.critical(self, "Error", "ROS 2 is not available in this environment.")
+                return
+            self.camera_worker = RosRealsenseWorker()
+            self.conn_status_label.setText("Waiting for ROS2...")
             self.camera_worker.connection_status.connect(self.on_connection_status)
         else:
             self.camera_worker = RealsenseWorker()
@@ -708,10 +654,10 @@ class MainWindow(QMainWindow):
 
     def on_connection_status(self, connected):
         if connected:
-            self.conn_status_label.setText("Wireless: Connected 🟢")
+            self.conn_status_label.setText("ROS2: Receiving 🟢")
             self.conn_status_label.setStyleSheet("color: green; font-weight: bold;")
         else:
-            self.conn_status_label.setText("Wireless: Disconnected 🔴")
+            self.conn_status_label.setText("ROS2: Waiting 🔴")
             self.conn_status_label.setStyleSheet("color: red; font-weight: bold;")
 
     def on_frame_ready(self, color, depth, stats):
