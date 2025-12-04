@@ -96,7 +96,37 @@ class RosRealsenseWorker(QThread):
         self.frame_idx = 0
         return self.record_dir
 
-    def callback(self, color_msg, depth_msg):
+    def run(self):
+        if not ROS_AVAILABLE:
+            self.error_occurred.emit("ROS 2 libraries not found.")
+            return
+
+        try:
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception as e:
+            print(f"RCLPY Init error: {e}")
+
+        self.node = rclpy.create_node('laptop_visualizer')
+        
+        # Subscribe to Color only (since publisher is currently color-only)
+        self.sub = self.node.create_subscription(
+            Image, 
+            '/camera/color/image_raw', 
+            self.callback, 
+            10
+        )
+        
+        self.running = True
+        self.connection_status.emit(True) # Optimistic init
+
+        while self.running and rclpy.ok():
+            # Spin once to process callbacks
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+            
+        self.node.destroy_node()
+
+    def callback(self, color_msg):
         if self.paused:
             return
 
@@ -105,13 +135,13 @@ class RosRealsenseWorker(QThread):
             color_arr = np.frombuffer(color_msg.data, dtype=np.uint8)
             color_image = color_arr.reshape((color_msg.height, color_msg.width, 3))
             
-            # Decode Depth (16UC1)
-            depth_arr = np.frombuffer(depth_msg.data, dtype=np.uint16)
-            depth_image = depth_arr.reshape((depth_msg.height, depth_msg.width))
+            # Create dummy Depth (16UC1) of same size
+            depth_image = np.zeros((color_msg.height, color_msg.width), dtype=np.uint16)
 
             # Recording logic
             if self.recording and self.images_dir:
                 cv2.imwrite(os.path.join(self.images_dir, f"frame_{self.frame_idx:05d}.jpg"), color_image)
+                # Save dummy depth or skip? Saving black depth for now to maintain file pairs
                 cv2.imwrite(os.path.join(self.images_dir, f"depth_{self.frame_idx:05d}.png"), depth_image)
                 self.frame_idx += 1
 
@@ -127,38 +157,6 @@ class RosRealsenseWorker(QThread):
             
         except Exception as e:
             print(f"Frame decode error: {e}")
-
-    def run(self):
-        if not ROS_AVAILABLE:
-            self.error_occurred.emit("ROS 2 libraries not found.")
-            return
-
-        try:
-            if not rclpy.ok():
-                rclpy.init()
-        except Exception as e:
-            print(f"RCLPY Init error: {e}")
-
-        self.node = rclpy.create_node('laptop_visualizer')
-        
-        # Subscribers
-        color_sub = message_filters.Subscriber(self.node, Image, '/camera/color/image_raw')
-        depth_sub = message_filters.Subscriber(self.node, Image, '/camera/depth/image_raw')
-        
-        # Sync (Approximate because timestamps might drift slightly over wireless)
-        ts = message_filters.ApproximateTimeSynchronizer([color_sub, depth_sub], 10, 0.1)
-        ts.registerCallback(self.callback)
-        
-        self.running = True
-        self.connection_status.emit(True) # Optimistic init
-
-        while self.running and rclpy.ok():
-            # Spin once to process callbacks
-            rclpy.spin_once(self.node, timeout_sec=0.1)
-            
-        self.node.destroy_node()
-        # Do not rclpy.shutdown() here if other nodes might exist, 
-        # but for this app it's likely fine or handled by global cleanup.
 
     def stop(self):
         self.running = False
