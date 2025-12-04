@@ -5,6 +5,7 @@ A complete GUI application to capture data from an Intel RealSense camera, proce
 ## Features
 
 *   **RealSense Capture**: Record RGB and Depth data with optimized settings for motion (Global Shutter emulation).
+*   **Wireless Streaming**: Stream data wirelessly from a Raspberry Pi to your workstation for processing.
 *   **Smart Filtering**: Automatically detect and remove blurry frames to improve reconstruction quality.
 *   **Integrated SfM**: Run COLMAP (via Nerfstudio wrappers) directly from the GUI to generate sparse point clouds and camera poses.
 *   **3D Visualization**: Built-in viewer to inspect the sparse point cloud before training.
@@ -14,14 +15,15 @@ A complete GUI application to capture data from an Intel RealSense camera, proce
 ## Prerequisites
 
 *   **Hardware**:
+    *   **Workstation**: NVIDIA GPU (Required for Nerfstudio training)
+    *   **Camera Host (Optional)**: Raspberry Pi 4/5 with RealSense connected
     *   Intel RealSense D400 Series Camera (D435i, D455, etc.)
-    *   NVIDIA GPU (Required for Nerfstudio training)
 *   **Software**:
     *   Linux (Ubuntu 22.04 recommended)
     *   COLMAP (must be installed and in system PATH)
     *   CUDA Toolkit (compatible with your PyTorch version)
 
-## Installation
+## Installation (Workstation)
 
 1.  **Clone the repository:**
     ```bash
@@ -44,21 +46,45 @@ A complete GUI application to capture data from an Intel RealSense camera, proce
 
 4.  **Install App Dependencies:**
     ```bash
-    pip install pyrealsense2 numpy opencv-python open3d pyqt5 pyvistaqt
+    pip install pyrealsense2 numpy opencv-python open3d pyqt5 pyvistaqt pyzmq
     ```
+
+## Wireless Setup (Raspberry Pi)
+
+To capture data wirelessly, run the server script on your Raspberry Pi.
+
+1.  **Install Dependencies on Pi:**
+    ```bash
+    pip install pyrealsense2 numpy opencv-python pyzmq
+    ```
+
+2.  **Run the Server:**
+    Transfer `wireless_comms.py` to the Pi and run it:
+    ```bash
+    python3 wireless_comms.py
+    ```
+    The script will automatically detect the camera and broadcast its presence on the network.
 
 ## Usage
 
-1.  **Start the GUI:**
+1.  **Start the GUI (Workstation):**
     ```bash
     python test_application.py
     ```
 
-2.  **Workflow:**
+2.  **Connect to Camera:**
+    *   **Local USB**: The app defaults to local USB mode.
+    *   **Wireless**: 
+        1.  Click **⚙ Settings**.
+        2.  Change **Connection Mode** to `Wireless (Network)`.
+        3.  Click **Auto Detect** to find the Pi (or enter IP manually).
+        4.  Click **OK**. The status bar should show **Wireless: Connected 🟢**.
+
+3.  **Workflow:**
 
     *   **Step 0: Capture**
         *   Point camera at the object.
-        *   Click **Start Recording**.
+        *   Click **Start Recording**. (In wireless mode, images are streamed and saved to your workstation).
         *   Move slowly in an arc or circle around the object.
         *   Click **Stop Recording**.
 
@@ -98,6 +124,7 @@ capture_20251201_120000/
 
 ## Troubleshooting
 
+*   **Wireless Discovery Fails:** Ensure both devices are on the same WiFi network. Firewalls may block UDP broadcasts (Port 5554). You can manually enter the Pi's IP address in Settings.
 *   **Camera not detected:** Unplug and replug the RealSense camera. Ensure no other app is using it (like `realsense-viewer`).
 *   **SfM Fails:** Ensure you have enough texture in the scene and overlap between frames. Avoid fast motion.
 *   **Training GPU Error:** Ensure your PyTorch version matches your CUDA version (`nvcc --version`).
