@@ -373,6 +373,10 @@ class SettingsDialog(QDialog):
         self.port_spin.setValue(self.settings.get('viser_port', 7007))
         proc_layout.addRow("Viser Port:", self.port_spin)
         
+        self.coord_check = QCheckBox()
+        self.coord_check.setChecked(self.settings.get('adjust_coord', False))
+        proc_layout.addRow("Adjust Coordinate Frame:", self.coord_check)
+
         self.proc_tab.setLayout(proc_layout)
         self.tabs.addTab(self.proc_tab, "Processing")
 
@@ -401,7 +405,8 @@ class SettingsDialog(QDialog):
             'height': h,
             'max_frames': self.max_frames_spin.value(),
             'min_frames': self.settings.get('min_frames', 50),
-            'viser_port': self.port_spin.value()
+            'viser_port': self.port_spin.value(),
+            'adjust_coord': self.coord_check.isChecked()
         }
 
 class MainWindow(QMainWindow):
@@ -423,7 +428,8 @@ class MainWindow(QMainWindow):
             'target_fps': 30,
             'width': 640,
             'height': 480,
-            'viser_port': 7007
+            'viser_port': 7007,
+            'adjust_coord': False
         }
 
         # Workers
@@ -514,9 +520,9 @@ class MainWindow(QMainWindow):
 
         self.metric_labels = {}
         metric_items = [
-            ('matched_frames', 'Matched Frames'),
-            ('sparse_points', 'Sparse Points'),
-            ('gaussians', 'Gaussians'),
+            ('num_matched_frames', 'Matched Frames'),
+            ('num_sparse_points', 'Sparse Points'),
+            ('num_gaussians', 'Gaussians'),
             ('psnr', 'PSNR'),
             ('ssim', 'SSIM'),
         ]
@@ -837,6 +843,12 @@ class MainWindow(QMainWindow):
                 points = np.asarray(pcd.points)
                 colors = np.asarray(pcd.colors)
 
+                if self.settings.get('adjust_coord', False):
+                    # Transform [x, -z, -y] -> [x, y, z]
+                    points = points[:, [0, 2, 1]]
+                    points[:, 1] = -points[:, 1]
+                    points[:, 2] = -points[:, 2]
+
                 if self.pv_actor:
                     self.plotter.remove_actor(self.pv_actor)
 
@@ -877,9 +889,53 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Training", f"Training started!\nViewer: {viewer_url}")
 
     def run_export(self):
-        # Placeholder for export functionality
-        if not self.current_recording_dir: return
-        QMessageBox.information(self, "Export", "Export functionality to be implemented.")
+        if not self.current_recording_dir:
+            QMessageBox.warning(self, "Error", "No recording selected.")
+            return
+            
+        # 1. Find the config file
+        outputs_dir = os.path.join(self.current_recording_dir, "outputs")
+        if not os.path.exists(outputs_dir):
+            QMessageBox.warning(self, "Error", "No trained model found (outputs dir missing).")
+            return
+            
+        # Find all config.yml files recursively
+        configs = []
+        for root, dirs, files in os.walk(outputs_dir):
+            if "config.yml" in files:
+                configs.append(os.path.join(root, "config.yml"))
+                
+        if not configs:
+            QMessageBox.warning(self, "Error", "No config.yml found in outputs.")
+            return
+            
+        # Get the most recent config
+        best_config = max(configs, key=os.path.getmtime)
+        
+        # 2. Define export path
+        export_dir = os.path.join(self.current_recording_dir, "gs_export")
+        os.makedirs(export_dir, exist_ok=True)
+        # gs_trainer.export_ply uses dirname of the path passed to it
+        dummy_path = os.path.join(export_dir, "point_cloud.ply")
+        
+        # 3. Run export
+        self.statusBar().showMessage(f"Exporting from {os.path.basename(os.path.dirname(best_config))}...")
+        QApplication.processEvents() # Update UI
+        
+        try:
+            self.gs_trainer.export_ply(
+                config_path=best_config,
+                output_path=dummy_path,
+                cwd=self.current_recording_dir
+            )
+            # Auto-calculate metrics to update Gaussian count
+            self.calculate_metrics()
+            
+            QMessageBox.information(self, "Success", f"Export complete!\nSaved to: {export_dir}")
+            self.statusBar().showMessage(f"Export saved to {export_dir}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed: {e}")
+            self.statusBar().showMessage("Export failed.")
 
     def select_output_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
@@ -907,13 +963,14 @@ class MainWindow(QMainWindow):
                     min-width: 100px;
                 """)
             
-            # Try to load existing metrics
+            # Load existing metrics
             self.metrics_calculator.set_data_dir(self.current_recording_dir)
-            # ... (rest of loading logic would go here)
+            self.calculate_metrics()
 
     def calculate_metrics(self):
         if not self.current_recording_dir:
             return
+        
         self.metrics_calculator.set_data_dir(self.current_recording_dir)
         self.metrics_calculator.count_matched_frames()
         self.metrics_calculator.count_sparse_points()
@@ -923,10 +980,20 @@ class MainWindow(QMainWindow):
     def calculate_psnr_ssim(self):
         if not self.current_recording_dir:
             return
+            
+        self.statusBar().showMessage("Calculating PSNR/SSIM (this may take a while)...")
+        QApplication.processEvents()
+
         self.metrics_calculator.set_data_dir(self.current_recording_dir)
-        # This would likely be a long running task, ideally in a thread
-        self.metrics_calculator.calculate_psnr_ssim()
+        psnr, ssim = self.metrics_calculator.calculate_psnr_ssim()
         self.update_metrics_display()
+
+        if psnr is not None and ssim is not None:
+            QMessageBox.information(self, "Metrics Calculated", f"PSNR: {psnr:.2f}\nSSIM: {ssim:.4f}")
+            self.statusBar().showMessage(f"Metrics: PSNR {psnr:.2f}, SSIM {ssim:.4f}")
+        else:
+            QMessageBox.warning(self, "Error", "Could not calculate PSNR/SSIM.\nCheck if model is trained (config.yml needed).")
+            self.statusBar().showMessage("Metrics calculation failed.")
 
     def export_metrics(self):
         if not self.current_recording_dir:
@@ -938,9 +1005,15 @@ class MainWindow(QMainWindow):
     def update_metrics_display(self):
         metrics = self.metrics_calculator.get_metrics()
         for key, value in metrics.items():
-            if key in self.metric_labels:
+            if key == 'num_matched_frames' and metrics.get('total_input_frames') is not None:
+                self.metric_labels[key].setText(f"{value} / {metrics['total_input_frames']}")
+            elif key in self.metric_labels:
                 if isinstance(value, (int, float)):
-                    self.metric_labels[key].setText(f"{value:.2f}" if isinstance(value, float) else str(value))
+                    # Check for float values and format them to 2 decimal places
+                    if isinstance(value, float):
+                        self.metric_labels[key].setText(f"{value:.2f}")
+                    else:
+                        self.metric_labels[key].setText(str(value))
                 else:
                     self.metric_labels[key].setText(str(value))
 

@@ -472,6 +472,14 @@ class MetricsCalculator:
 
         return "\n".join(lines)
 
+    def get_metrics(self):
+        """Return the current metrics dictionary"""
+        return self.metrics
+
+    def export_metrics(self):
+        """Alias for export_to_csv to support GUI"""
+        return self.export_to_csv()
+
 
 # Standalone usage
 if __name__ == "__main__":
