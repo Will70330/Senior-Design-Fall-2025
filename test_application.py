@@ -8,6 +8,7 @@ and training 3D Gaussian Splatting models.
 
 import sys
 import os
+import subprocess
 
 # Add venv site-packages to path to allow importing modules (Open3D, etc.) 
 # when running with system python (for ROS 2)
@@ -458,6 +459,11 @@ class SettingsDialog(QDialog):
         self.coord_check.setChecked(self.settings.get('adjust_coord', False))
         proc_layout.addRow("Adjust Coordinate Frame:", self.coord_check)
 
+        self.viewer_version_combo = QComboBox()
+        self.viewer_version_combo.addItems(["V1", "V3", "V4"])
+        self.viewer_version_combo.setCurrentText(self.settings.get('viewer_version', "V4"))
+        proc_layout.addRow("Viewer Version:", self.viewer_version_combo)
+
         self.proc_tab.setLayout(proc_layout)
         self.tabs.addTab(self.proc_tab, "Processing")
 
@@ -511,7 +517,8 @@ class SettingsDialog(QDialog):
             'max_frames': self.max_frames_spin.value(),
             'min_frames': self.settings.get('min_frames', 50),
             'viser_port': self.port_spin.value(),
-            'adjust_coord': self.coord_check.isChecked()
+            'adjust_coord': self.coord_check.isChecked(),
+            'viewer_version': self.viewer_version_combo.currentText()
         }
 
 class MainWindow(QMainWindow):
@@ -539,7 +546,8 @@ class MainWindow(QMainWindow):
             'width': 640,
             'height': 480,
             'viser_port': 7007,
-            'adjust_coord': False
+            'adjust_coord': False,
+            'viewer_version': 'V4'
         }
 
         # Workers
@@ -758,6 +766,12 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("4. Export PLY")
         self.export_btn.clicked.connect(self.run_export)
         controls.addWidget(self.export_btn)
+
+        # Render
+        self.render_btn = QPushButton("5. Render")
+        self.render_btn.clicked.connect(self.run_render)
+        self.render_btn.setStyleSheet("background-color: #E91E63; color: white;")
+        controls.addWidget(self.render_btn)
         
         main_layout.addLayout(controls)
         self.statusBar().showMessage("Ready")
@@ -1203,6 +1217,43 @@ class MainWindow(QMainWindow):
                         self.metric_labels[key].setText(str(value))
                 else:
                     self.metric_labels[key].setText(str(value))
+
+    def run_render(self):
+        if not self.current_recording_dir:
+            QMessageBox.warning(self, "Error", "No recording selected.")
+            return
+            
+        # Look for splat.ply in gs_export
+        ply_path = os.path.join(self.current_recording_dir, "gs_export", "splat.ply")
+        if not os.path.exists(ply_path):
+             # Fallback to point_cloud.ply just in case
+             fallback = os.path.join(self.current_recording_dir, "gs_export", "point_cloud.ply")
+             if os.path.exists(fallback):
+                 ply_path = fallback
+             else:
+                 QMessageBox.warning(self, "Error", f"splat.ply not found in gs_export.\nDid you run 'Export PLY'?")
+                 return
+        
+        # Path to external viewer
+        version = self.settings.get('viewer_version', 'V4')
+        base_paths = {
+            'V1': "~/Desktop/linux_build",
+            'V3': "~/Desktop/linux_buildV3",
+            'V4': "~/Desktop/linux_buildV4"
+        }
+        base_path = base_paths.get(version, "~/Desktop/linux_buildV4")
+        viewer_path = os.path.expanduser(os.path.join(base_path, "ptc.x86_64"))
+
+        if not os.path.exists(viewer_path):
+             QMessageBox.critical(self, "Error", f"Viewer application ({version}) not found at:\n{viewer_path}")
+             return
+             
+        # Launch
+        try:
+            subprocess.Popen([viewer_path, "--ply", ply_path], preexec_fn=os.setsid)
+            self.statusBar().showMessage(f"Launched renderer with {os.path.basename(ply_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to launch renderer: {e}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

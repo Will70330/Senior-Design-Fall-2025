@@ -3,15 +3,15 @@
   "method_name": "splatfacto",
   "checkpoint": "outputs/benedum-12-showcase/splatfacto/2025-12-03_235937/nerfstudio_models/step-000002000.ckpt",
   "results": {
-    "psnr": 15.641335487365723,
-    "psnr_std": 1.5057451725006104,
-    "ssim": 0.6669477224349976,
-    "ssim_std": 0.07060489058494568,
-    "lpips": 0.6775203943252563,
-    "lpips_std": 0.05421165004372597,
-    "num_rays_per_sec": 45733420.0,
-    "num_rays_per_sec_std": 16908008.0,
-    "fps": 3.7530360221862793,
-    "fps_std": 1.3875272274017334
+    "psnr": 17.46335220336914,
+    "psnr_std": 1.6031646728515625,
+    "ssim": 0.6974577903747559,
+    "ssim_std": 0.06165232136845589,
+    "lpips": 0.6310956478118896,
+    "lpips_std": 0.049709565937519073,
+    "num_rays_per_sec": 47394716.0,
+    "num_rays_per_sec_std": 19458794.0,
+    "fps": 3.8893673419952393,
+    "fps_std": 1.5968530178070068
   }
 }
