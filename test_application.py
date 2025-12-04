@@ -35,7 +35,10 @@ import time
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image, CameraInfo
+    from sensor_msgs.msg import Image, CameraInfo, CompressedImage
+    from std_msgs.msg import String
+    from rcl_interfaces.srv import SetParameters
+    from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
     import message_filters
     ROS_AVAILABLE = True
 except ImportError:
@@ -70,6 +73,7 @@ class RosRealsenseWorker(QThread):
     frame_ready = pyqtSignal(np.ndarray, np.ndarray, dict)  # color, depth, stats
     error_occurred = pyqtSignal(str)
     connection_status = pyqtSignal(bool)
+    capabilities_received = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -77,6 +81,8 @@ class RosRealsenseWorker(QThread):
         self.paused = False
         self.recording = False
         self.node = None
+        self.param_client = None
+        self.caps_sub = None
         
         # Recording state
         self.record_dir = None
@@ -109,13 +115,24 @@ class RosRealsenseWorker(QThread):
 
         self.node = rclpy.create_node('laptop_visualizer')
         
-        # Subscribe to Color only (since publisher is currently color-only)
+        # Subscribe to Compressed Color
         self.sub = self.node.create_subscription(
-            Image, 
-            '/camera/color/image_raw', 
+            CompressedImage, 
+            '/camera/color/compressed', 
             self.callback, 
             10
         )
+        
+        # Subscribe to Capabilities
+        self.caps_sub = self.node.create_subscription(
+            String,
+            '/camera/capabilities',
+            self.caps_callback,
+            10
+        )
+        
+        # Parameter Client
+        self.param_client = self.node.create_client(SetParameters, '/realsense_publisher/set_parameters')
         
         self.running = True
         self.connection_status.emit(True) # Optimistic init
@@ -125,18 +142,53 @@ class RosRealsenseWorker(QThread):
             rclpy.spin_once(self.node, timeout_sec=0.1)
             
         self.node.destroy_node()
+        
+    def caps_callback(self, msg):
+        self.capabilities_received.emit(msg.data)
 
-    def callback(self, color_msg):
+    def set_remote_parameters(self, width, height, fps):
+        if not self.param_client:
+            return
+            
+        req = SetParameters.Request()
+        
+        # Width
+        p_w = Parameter()
+        p_w.name = "width"
+        p_w.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=width)
+        
+        # Height
+        p_h = Parameter()
+        p_h.name = "height"
+        p_h.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=height)
+        
+        # FPS
+        p_f = Parameter()
+        p_f.name = "fps"
+        p_f.value = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=fps)
+        
+        req.parameters = [p_w, p_h, p_f]
+        
+        # Async call (fire and forget from GUI perspective, worker handles response in spin)
+        future = self.param_client.call_async(req)
+        # We don't strictly need to wait for result here as we rely on visual feedback
+        
+    def callback(self, compressed_msg):
         if self.paused:
             return
 
         try:
-            # Decode Color (BGR8)
-            color_arr = np.frombuffer(color_msg.data, dtype=np.uint8)
-            color_image = color_arr.reshape((color_msg.height, color_msg.width, 3))
+            # Decode Compressed Image
+            np_arr = np.frombuffer(compressed_msg.data, np.uint8)
+            color_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
-            # Create dummy Depth (16UC1) of same size
-            depth_image = np.zeros((color_msg.height, color_msg.width), dtype=np.uint16)
+            if color_image is None:
+                print("Failed to decode compressed image")
+                return
+
+            # Create dummy Depth (same size as color)
+            h, w, _ = color_image.shape
+            depth_image = np.zeros((h, w), dtype=np.uint16)
 
             # Recording logic
             if self.recording and self.images_dir:
@@ -318,9 +370,10 @@ class ProcessingDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent, settings):
+    def __init__(self, parent, settings, capabilities=None):
         super().__init__(parent)
         self.settings = settings
+        self.capabilities = capabilities
         self.setWindowTitle("Settings")
         self.setModal(True)
         
@@ -336,23 +389,53 @@ class SettingsDialog(QDialog):
         self.mode_combo.setCurrentText(self.settings.get('mode', "Local USB"))
         cam_layout.addRow("Connection Mode:", self.mode_combo)
         
-        # ROS 2 uses discovery, IP optional but kept for UI consistency or future advanced config
+        # ROS 2 uses discovery
         self.ip_input = QLineEdit()
         self.ip_input.setText(self.settings.get('ip_address', ""))
         self.ip_input.setPlaceholderText("Auto-Discovery (Leave Empty)")
-        self.ip_input.setEnabled(False) # Disabled for ROS 2 auto-discovery
+        self.ip_input.setEnabled(False)
         cam_layout.addRow("Camera IP:", self.ip_input)
         
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(1, 60)
-        self.fps_spin.setValue(self.settings.get('target_fps', 30))
-        cam_layout.addRow("Target FPS:", self.fps_spin)
-        
+        # Dynamic Resolution/FPS handling
         self.res_combo = QComboBox()
-        self.res_combo.addItems(["640x480", "848x480", "1280x720", "424x240"])
-        cur_res = f"{self.settings.get('width', 640)}x{self.settings.get('height', 480)}"
-        self.res_combo.setCurrentText(cur_res)
-        cam_layout.addRow("Resolution:", self.res_combo)
+        self.fps_combo = QComboBox()
+        
+        if self.capabilities and self.mode_combo.currentText() == "Wireless (ROS 2)":
+            # Populate from capabilities
+            # Caps structure: [{'width': 640, 'height': 480, 'fps': 30}, ...]
+            self.unique_res = sorted(list(set([(c['width'], c['height']) for c in self.capabilities])), reverse=True)
+            for w, h in self.unique_res:
+                self.res_combo.addItem(f"{w}x{h}")
+            
+            # Set current selection
+            cur_res_str = f"{self.settings.get('width')}x{self.settings.get('height')}"
+            index = self.res_combo.findText(cur_res_str)
+            if index >= 0:
+                self.res_combo.setCurrentIndex(index)
+            
+            self.res_combo.currentIndexChanged.connect(self.update_fps_options)
+            self.update_fps_options() # Init fps combo
+            
+            cam_layout.addRow("Resolution:", self.res_combo)
+            cam_layout.addRow("Target FPS:", self.fps_combo)
+            
+            # Hide simple spin box used for local
+            self.fps_spin = QSpinBox() 
+            self.fps_spin.setVisible(False)
+            
+        else:
+            # Default static options
+            self.fps_spin = QSpinBox()
+            self.fps_spin.setRange(1, 60)
+            self.fps_spin.setValue(self.settings.get('target_fps', 30))
+            cam_layout.addRow("Target FPS:", self.fps_spin)
+            
+            self.res_combo.addItems(["640x480", "848x480", "1280x720", "424x240"])
+            cur_res = f"{self.settings.get('width', 640)}x{self.settings.get('height', 480)}"
+            self.res_combo.setCurrentText(cur_res)
+            cam_layout.addRow("Resolution:", self.res_combo)
+            
+            self.fps_combo.setVisible(False)
 
         self.cam_tab.setLayout(cam_layout)
         self.tabs.addTab(self.cam_tab, "Camera")
@@ -386,19 +469,43 @@ class SettingsDialog(QDialog):
         self.layout.addWidget(buttons)
         self.setLayout(self.layout)
         
-        # Trigger mode update
         self.mode_combo.currentTextChanged.connect(self.toggle_ip_field)
-        self.toggle_ip_field(self.mode_combo.currentText())
+    
+    def update_fps_options(self):
+        if not self.capabilities: return
+        
+        current_res_str = self.res_combo.currentText()
+        w, h = map(int, current_res_str.split('x'))
+        
+        # Find valid fps for this res
+        valid_fps = [c['fps'] for c in self.capabilities if c['width'] == w and c['height'] == h]
+        valid_fps = sorted(list(set(valid_fps)), reverse=True)
+        
+        self.fps_combo.clear()
+        for fps in valid_fps:
+            self.fps_combo.addItem(str(fps))
+            
+        # Try to keep current fps selection
+        cur_fps = str(self.settings.get('target_fps', 30))
+        idx = self.fps_combo.findText(cur_fps)
+        if idx >= 0:
+            self.fps_combo.setCurrentIndex(idx)
 
     def toggle_ip_field(self, text):
-        pass # Kept for compatibility, but currently no-op as we force auto-discovery
+        pass
 
     def get_settings(self):
         w, h = map(int, self.res_combo.currentText().split('x'))
+        
+        if self.fps_combo.isVisible():
+            fps = int(self.fps_combo.currentText())
+        else:
+            fps = self.fps_spin.value()
+            
         return {
             'mode': self.mode_combo.currentText(),
             'ip_address': self.ip_input.text(),
-            'target_fps': self.fps_spin.value(),
+            'target_fps': fps,
             'width': w,
             'height': h,
             'max_frames': self.max_frames_spin.value(),
@@ -416,6 +523,11 @@ class MainWindow(QMainWindow):
         # State
         self.output_dir = os.getcwd()
         self.current_recording_dir = None
+        self.camera_capabilities = None
+        
+        # Frame buffer for snapshots
+        self.latest_color = None
+        self.latest_depth = None
         
         # Settings
         self.settings = {
@@ -438,6 +550,13 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.start_camera()
+        
+    def update_capabilities(self, json_str):
+        try:
+            self.camera_capabilities = json.loads(json_str)
+            # self.statusBar().showMessage(f"Camera capabilities received ({len(self.camera_capabilities)} modes)")
+        except Exception as e:
+            print(f"Error parsing capabilities: {e}")
 
     def init_ui(self):
         central = QWidget()
@@ -594,6 +713,12 @@ class MainWindow(QMainWindow):
         self.record_btn.setStyleSheet("padding: 10px; font-weight: bold;")
         controls.addWidget(self.record_btn)
         
+        # Snapshot
+        self.snap_btn = QPushButton("📷 Snapshot")
+        self.snap_btn.clicked.connect(self.take_snapshot)
+        self.snap_btn.setStyleSheet("padding: 10px; font-weight: bold; background-color: #007bff; color: white;")
+        controls.addWidget(self.snap_btn)
+        
         controls.addStretch() # Separator
         
         # Reset Images
@@ -638,19 +763,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
     def show_settings(self):
-        dialog = SettingsDialog(self, self.settings)
+        dialog = SettingsDialog(self, self.settings, self.camera_capabilities)
         if dialog.exec_() == QDialog.Accepted:
             new_settings = dialog.get_settings()
             old_mode = self.settings.get('mode')
             self.settings = new_settings
             
-            # Restart camera if settings changed that affect it
-            if self.camera_worker:
-                self.camera_worker.stop()
-                self.camera_worker.wait()
+            # Case 1: Mode Changed (Stop everything and restart with new mode)
+            if old_mode != self.settings['mode']:
+                if self.camera_worker:
+                    self.camera_worker.stop()
+                    self.camera_worker.wait()
+                self.start_camera()
             
-            self.start_camera()
-            
+            # Case 2: Mode is same, but settings might have changed
+            elif "Wireless" in self.settings['mode']:
+                # Apply Remote Parameters
+                if self.camera_worker and isinstance(self.camera_worker, RosRealsenseWorker):
+                    self.camera_worker.set_remote_parameters(
+                        self.settings['width'],
+                        self.settings['height'],
+                        self.settings['target_fps']
+                    )
+            elif "Local" in self.settings['mode']:
+                 # Restart local camera to apply settings
+                 if self.camera_worker:
+                    self.camera_worker.stop()
+                    self.camera_worker.wait()
+                 self.start_camera()
+
             self.statusBar().showMessage("Settings updated")
 
     def rename_images_for_training(self):
@@ -686,6 +827,7 @@ class MainWindow(QMainWindow):
             self.camera_worker = RosRealsenseWorker()
             self.conn_status_label.setText("Waiting for ROS2...")
             self.camera_worker.connection_status.connect(self.on_connection_status)
+            self.camera_worker.capabilities_received.connect(self.update_capabilities)
         else:
             self.camera_worker = RealsenseWorker()
             self.conn_status_label.setText("Local Camera")
@@ -699,6 +841,7 @@ class MainWindow(QMainWindow):
         self.camera_worker.error_occurred.connect(lambda e: self.statusBar().showMessage(f"Camera Error: {e}"))
         self.camera_worker.start()
 
+
     def on_connection_status(self, connected):
         if connected:
             self.conn_status_label.setText("ROS2: Receiving 🟢")
@@ -708,6 +851,9 @@ class MainWindow(QMainWindow):
             self.conn_status_label.setStyleSheet("color: red; font-weight: bold;")
 
     def on_frame_ready(self, color, depth, stats):
+        self.latest_color = color
+        self.latest_depth = depth
+        
         # Update Image
         rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
@@ -724,6 +870,49 @@ class MainWindow(QMainWindow):
         else:
             self.record_btn.setText("Start Recording")
             self.record_btn.setStyleSheet("padding: 10px;")
+
+    def take_snapshot(self):
+        if self.latest_color is None:
+            QMessageBox.warning(self, "Warning", "No image available to capture.")
+            return
+
+        # Determine where to save
+        target_dir = self.current_recording_dir
+        if not target_dir:
+            # If not currently recording, create a new capture directory
+            if self.camera_worker:
+                target_dir = self.camera_worker.create_recording_dir(self.output_dir)
+                self.current_recording_dir = target_dir
+                self.out_label.setText(f"Current: {os.path.basename(target_dir)}")
+            else:
+                # Fallback manual creation
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                target_dir = os.path.join(self.output_dir, f"capture_{timestamp}")
+                os.makedirs(target_dir, exist_ok=True)
+                self.current_recording_dir = target_dir
+                self.out_label.setText(f"Current: {os.path.basename(target_dir)}")
+
+        # Create snapshots subfolder
+        snap_dir = os.path.join(target_dir, "snapshots")
+        os.makedirs(snap_dir, exist_ok=True)
+
+        # Generate filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        img_name = f"snapshot_{timestamp}.jpg"
+        depth_name = f"depth_{timestamp}.png"
+        
+        img_path = os.path.join(snap_dir, img_name)
+        depth_path = os.path.join(snap_dir, depth_name)
+
+        try:
+            cv2.imwrite(img_path, self.latest_color)
+            if self.latest_depth is not None:
+                cv2.imwrite(depth_path, self.latest_depth)
+            
+            self.statusBar().showMessage(f"Snapshot saved: {img_name}")
+            # Flash effect or similar could be added here, but status message is sufficient for now
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save snapshot: {e}")
 
     def toggle_recording(self, checked):
         if not self.camera_worker: return
