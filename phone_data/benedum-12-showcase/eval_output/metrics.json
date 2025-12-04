@@ -1,0 +1,17 @@
+{
+  "experiment_name": "benedum-12-showcase",
+  "method_name": "splatfacto",
+  "checkpoint": "outputs/benedum-12-showcase/splatfacto/2025-12-03_230453/nerfstudio_models/step-000002000.ckpt",
+  "results": {
+    "psnr": 21.282394409179688,
+    "psnr_std": 1.4447829723358154,
+    "ssim": 0.7602656483650208,
+    "ssim_std": 0.04533597454428673,
+    "lpips": 0.5643188953399658,
+    "lpips_std": 0.04653697833418846,
+    "num_rays_per_sec": 47078020.0,
+    "num_rays_per_sec_std": 16144545.0,
+    "fps": 3.8633785247802734,
+    "fps_std": 1.3248748779296875
+  }
+}
